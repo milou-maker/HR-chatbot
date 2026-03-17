@@ -6,22 +6,24 @@ app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// Fetch relevant pages from Confluence based on the employee's question
-async function searchConfluence(query) {
+// Fetch pages directly from a Confluence space
+async function getConfluenceContent(query) {
   const baseUrl = process.env.CONFLUENCE_BASE_URL;
   const email = process.env.CONFLUENCE_EMAIL;
   const token = process.env.CONFLUENCE_API_TOKEN;
+  const spaceKey = process.env.CONFLUENCE_SPACE_KEY || 'PC';
 
   if (!baseUrl || !email || !token) {
-    console.log('Confluence credentials not set, skipping knowledge base lookup');
+    console.log('Confluence credentials not set');
     return '';
   }
 
   try {
     const auth = Buffer.from(`${email}:${token}`).toString('base64');
 
-    // Search Confluence for relevant pages
-    const searchUrl = `https://${baseUrl}/wiki/rest/api/content/search?cql=text~"${encodeURIComponent(query)}" AND type=page&limit=3&expand=body.storage`;
+    // Search within the specific space using CQL
+    const cql = `space="${spaceKey}" AND type=page AND text~"${query}"`;
+    const searchUrl = `https://${baseUrl}/wiki/rest/api/content/search?cql=${encodeURIComponent(cql)}&limit=3&expand=body.storage`;
 
     const response = await fetch(searchUrl, {
       headers: {
@@ -31,30 +33,29 @@ async function searchConfluence(query) {
     });
 
     if (!response.ok) {
-      console.error('Confluence search failed:', response.status);
-      return '';
+      const errorText = await response.text();
+      console.error('Confluence search failed:', response.status, errorText);
+      return await getSpacePages(baseUrl, auth, spaceKey, query);
     }
 
     const data = await response.json();
 
     if (!data.results || data.results.length === 0) {
-      console.log('No Confluence pages found for query:', query);
-      return '';
+      console.log('No search results, fetching all space pages instead');
+      return await getSpacePages(baseUrl, auth, spaceKey, query);
     }
 
-    // Extract text content from the top results
     const content = data.results.map(page => {
       const title = page.title;
-      // Strip HTML tags from the page body
       const body = page.body?.storage?.value
         ?.replace(/<[^>]+>/g, ' ')
         ?.replace(/\s+/g, ' ')
         ?.trim()
-        ?.slice(0, 1500) || '';
+        ?.slice(0, 2000) || '';
       return `Page: ${title}\n${body}`;
     }).join('\n\n---\n\n');
 
-    console.log(`Found ${data.results.length} Confluence page(s) for: "${query}"`);
+    console.log(`Found ${data.results.length} Confluence page(s)`);
     return content;
 
   } catch (err) {
@@ -63,44 +64,89 @@ async function searchConfluence(query) {
   }
 }
 
+// Fallback: fetch all pages from the space
+async function getSpacePages(baseUrl, auth, spaceKey, query) {
+  try {
+    const url = `https://${baseUrl}/wiki/rest/api/content?spaceKey=${spaceKey}&type=page&limit=10&expand=body.storage`;
+
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      console.error('Space fetch failed:', response.status);
+      return '';
+    }
+
+    const data = await response.json();
+
+    if (!data.results || data.results.length === 0) {
+      console.log('No pages found in space:', spaceKey);
+      return '';
+    }
+
+    const keywords = query.toLowerCase().split(' ').filter(w => w.length > 3);
+    const relevant = data.results.filter(page =>
+      keywords.some(kw => page.title.toLowerCase().includes(kw))
+    );
+
+    const pages = relevant.length > 0 ? relevant : data.results.slice(0, 3);
+
+    const content = pages.map(page => {
+      const body = page.body?.storage?.value
+        ?.replace(/<[^>]+>/g, ' ')
+        ?.replace(/\s+/g, ' ')
+        ?.trim()
+        ?.slice(0, 2000) || '';
+      return `Page: ${page.title}\n${body}`;
+    }).join('\n\n---\n\n');
+
+    console.log(`Fetched ${pages.length} page(s) from space ${spaceKey}`);
+    return content;
+
+  } catch (err) {
+    console.error('Space fetch error:', err.message);
+    return '';
+  }
+}
+
 // Handle incoming Slack events
 app.post('/slack/events', async (req, res) => {
   const { type, event } = req.body;
 
-  // Slack verification challenge
   if (type === 'url_verification') {
     return res.json({ challenge: req.body.challenge });
   }
 
-  // Handle messages — ignore bot's own messages to avoid loops
   if (event?.type === 'app_mention' || event?.type === 'message') {
     if (event.bot_id || event.subtype) return res.sendStatus(200);
 
-    // Respond to Slack immediately to avoid timeout
     res.sendStatus(200);
 
-    // Clean the message text (remove the @HR Assistant mention if present)
     const userMessage = event.text?.replace(/<@[A-Z0-9]+>/g, '').trim();
     if (!userMessage) return;
 
     console.log(`Received message: "${userMessage}"`);
 
     try {
-      // Step 1: Search Confluence for relevant information
-      const confluenceContent = await searchConfluence(userMessage);
+      const confluenceContent = await getConfluenceContent(userMessage);
 
-      // Step 2: Build the system prompt, including Confluence content if found
-      let systemPrompt = `You are a helpful, warm HR assistant. Answer employee questions about company policies, benefits, time off, onboarding, and HR topics. Be concise and friendly.
+      let systemPrompt = `You are a helpful, warm HR assistant for Rentman. Answer employee questions about company policies, benefits, time off, onboarding, and HR topics. Be concise and friendly.
 
 If a question is sensitive (harassment, grievance, legal, health emergency), always say: "I'm looping in the HR team who can help you directly."
 
 If you cannot find a relevant answer, say: "I wasn't able to find a clear answer — I'm looping in the HR team to help you."`;
 
       if (confluenceContent) {
-        systemPrompt += `\n\nUse the following information from the company knowledge base to answer the question. Prioritise this over general knowledge:\n\n${confluenceContent}`;
+        systemPrompt += `\n\nUse the following information from the Rentman knowledge base to answer the question. Always prioritise this over general knowledge:\n\n${confluenceContent}`;
+        console.log('Using Confluence content in response');
+      } else {
+        console.log('No Confluence content found, using general knowledge');
       }
 
-      // Step 3: Call Claude API
       const message = await anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1000,
@@ -109,9 +155,7 @@ If you cannot find a relevant answer, say: "I wasn't able to find a clear answer
       });
 
       const reply = message.content[0].text;
-      console.log(`Sending reply: "${reply.slice(0, 100)}..."`);
 
-      // Step 4: Send reply back to Slack
       await fetch('https://slack.com/api/chat.postMessage', {
         method: 'POST',
         headers: {
@@ -121,14 +165,13 @@ If you cannot find a relevant answer, say: "I wasn't able to find a clear answer
         body: JSON.stringify({
           channel: event.channel,
           text: reply,
-          thread_ts: event.thread_ts || event.ts // reply in thread if possible
+          thread_ts: event.thread_ts || event.ts
         })
       });
 
     } catch (err) {
       console.error('Error processing message:', err.message);
 
-      // Send a fallback message to Slack so the employee isn't left hanging
       await fetch('https://slack.com/api/chat.postMessage', {
         method: 'POST',
         headers: {
@@ -146,10 +189,7 @@ If you cannot find a relevant answer, say: "I wasn't able to find a clear answer
   }
 });
 
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.send('HR bot is running!');
-});
+app.get('/', (req, res) => res.send('HR bot is running!'));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`HR bot listening on port ${PORT}`));
